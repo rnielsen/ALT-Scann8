@@ -238,3 +238,5 @@ fabric.properties
 
 # Local scanner session settings
 /ALT-Scann8.json
+/AGENTS.md
+/.idea/

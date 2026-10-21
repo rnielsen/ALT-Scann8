@@ -872,7 +872,8 @@ boolean film_detected(int pt_value)
     min_value = min(min_value, pt_value);
 
     instant_variance = max_value - min_value;
-    if (instant_variance > 50)
+    // Reject small empty-gate signal fluctuations when detecting film movement.
+    if (instant_variance > 150)
         return(true);
     else
         return(false);
