@@ -212,7 +212,7 @@ bool scan_process_ongoing = false;
 
 // JRE - Support data variables
 #define QUEUE_SIZE 20
-typedef struct Queue {
+struct Queue {
     int Data[QUEUE_SIZE];
     int Param[QUEUE_SIZE];
     int Param2[QUEUE_SIZE];
@@ -232,7 +232,8 @@ void(* resetFunc) (void) = 0;//declare reset function at address 0
 
 void setup() {
     // Possible serial speeds: 1200, 2400, 4800, 9600, 19200, 38400, 57600,74880, 115200, 230400, 250000, 500000, 1000000, 2000000
-    Serial.begin(1000000);  // As fast as possible for debug, otherwise it slows down execution
+    Serial.begin(1000000);  // Serial Monitor must also use 1000000 baud
+    Serial.println(F("[BOOT] ALT-Scann8 " __version__ " boot started"));
   
     Wire.begin(16);  // join I2c bus with address #16
     Wire.setClock(400000);  // Set the I2C clock frequency to 400 kHz
@@ -278,16 +279,29 @@ void setup() {
 
     // Adjust Min frame steps based on capstan diameter
     AdjustMinFrameStepsFromCapstanDiameter(CapstanDiameter);
+    Serial.println(F("[BOOT] setup complete"));
 }
 
 void loop() {
     int param;
     int cnt_ver_1 = 0, cnt_ver_2 = 0, cnt_ver_3 = 0;
-    char *pt;
+    char version[sizeof(__version__)];
+    unsigned long lastHeartbeat = 0;
 
     SendToRPi(RSP_FORCE_INIT, 0, 0);  // Request UI to resend init sequence, in case controller reloaded while UI active
 
     while (1) {
+        // Keep diagnostics independent of DebugState and avoid waiting on serial.
+        // Unsigned subtraction also handles the millis() counter wrapping.
+        unsigned long now = millis();
+        if (DebugState != PlotterInfo && now - lastHeartbeat >= 2000UL &&
+            Serial.availableForWrite() >= 48) {
+            lastHeartbeat = now;
+            Serial.print(F("[ALIVE] ms="));
+            Serial.print(now);
+            Serial.print(F(" state="));
+            Serial.println((int)ScanState);
+        }
         if (dataInCmdQueue())
             UI_Command = pop_cmd(&param);   // Get next command from queue if one exists
         else
@@ -438,7 +452,9 @@ void loop() {
                     case CMD_VERSION_ID:
                         DebugPrintStr(">V_ID");
                         char *pt;
-                        pt = strtok (__version__,".");
+                        // strtok modifies its input; copy afresh for every request.
+                        strcpy(version, __version__);
+                        pt = strtok (version,".");
                         if (pt != NULL) {
                             cnt_ver_1 = atoi(pt);
                             pt = strtok (NULL, ".");
@@ -1169,7 +1185,7 @@ void sendEvent() {
     }
 }
 
-boolean push(Queue * queue, int IncomingIc, int param, int param2) {
+boolean push(volatile Queue * queue, int IncomingIc, int param, int param2) {
     boolean retvalue = false;
     if ((queue -> in+1) % QUEUE_SIZE != queue -> out) {
         queue -> Data[queue -> in] = IncomingIc;
@@ -1183,7 +1199,7 @@ boolean push(Queue * queue, int IncomingIc, int param, int param2) {
     return(retvalue);
 }
 
-int pop(Queue * queue, int * param, int * param2) {
+int pop(volatile Queue * queue, int * param, int * param2) {
     int retvalue = -1;  // default return value: -1 (error)
     if (queue -> out != queue -> in) {
         retvalue = queue -> Data[queue -> out];
@@ -1199,13 +1215,13 @@ int pop(Queue * queue, int * param, int * param2) {
 }
 
 boolean push_cmd(int cmd, int param) {
-    push(&CommandQueue, cmd, param, 0);
+    return push(&CommandQueue, cmd, param, 0);
 }
 int pop_cmd(int * param) {
     return(pop(&CommandQueue, param, NULL));
 }
 boolean push_rsp(int rsp, int param, int param2) {
-    push(&ResponseQueue, rsp, param, param2);
+    return push(&ResponseQueue, rsp, param, param2);
 }
 int pop_rsp(int * param, int * param2) {
     return(pop(&ResponseQueue, param, param2));

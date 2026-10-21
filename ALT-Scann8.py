@@ -132,7 +132,7 @@ FocusZoomFactorX = 0.2
 FocusZoomFactorY = 0.2
 FreeWheelActive = False
 ManualUvLedOn = False
-BaseFolder = os.environ['HOME']
+BaseFolder = '/media/pi/SCANS'
 CurrentDir = ''
 NewBaseFolder = ''
 saved_locale = locale.getlocale(locale.LC_NUMERIC)   # Save current locale to restore it after displaying preview
@@ -818,7 +818,7 @@ def cmd_set_new_folder():
     success = False
 
     while requested_dir == "" or requested_dir is None:
-        requested_dir = tk.simpledialog.askstring(title="Enter new folder name",
+        requested_dir = tk.simpledialog.askstring(parent=win, title="Enter new folder name",
                                                   prompt=f"Enter new folder name (to be created under {BaseFolder}):")
         if requested_dir is None:
             return
@@ -1378,8 +1378,9 @@ def cmd_set_existing_folder():
     if CurrentDir == '':
         CurrentDir = BaseFolder
 
+    logging.info("Selecting existing capture folder from %s", CurrentDir)
     if not SimulatedRun:
-        NewDir = filedialog.askdirectory(initialdir=CurrentDir, title="Select existing folder for capture")
+        NewDir = filedialog.askdirectory(initialdir=CurrentDir, title="Select existing folder for capture", parent=win)
     else:
         NewDir = filedialog.askdirectory(initialdir=CurrentDir,
                                          title="Select existing folder with snapshots for simulated run")
@@ -1412,6 +1413,7 @@ def cmd_set_existing_folder():
         log_current_session()   # Before cleaning up session data, write it to disk
         CurrentFrame = NewCurrentFrame
         CurrentDir = NewDir
+        logging.info("Capture target folder set to %s", CurrentDir)
         scan_error_counter = scan_error_total_frames_counter = 0
         scan_error_counter_value.set(f"0 (0%)")
         with open(scan_error_log_fullpath, 'a') as f:
@@ -2162,12 +2164,36 @@ def cmd_set_negative_image():
     ConfigData["NegativeCaptureActive"] = NegativeImage
 
 
+def report_preview_timeout():
+    global RealTimeDisplay, FocusViewEnabled
+    RealTimeDisplay = False
+    FocusViewEnabled = False
+    real_time_display.set(False)
+    focus_peaking_checkbox.deselect()
+    real_time_zoom_checkbox.deselect()
+    # Do not queue another camera operation behind the stalled capture job.
+    real_time_display_checkbox.config(state=DISABLED)
+    start_btn.config(state=DISABLED)
+    draw_capture_canvas.config(highlightthickness=0)
+    locale.setlocale(locale.LC_NUMERIC, saved_locale)
+    logging.error("Live camera preview timed out; preview stopped to keep the interface responsive")
+    tk.messagebox.showerror(
+        "Camera stopped responding",
+        "The camera stopped delivering frames. Folder selection is still available. "
+        "Restart ALT-Scann8 before scanning. If this happens again, power off the Pi "
+        "before checking the camera ribbon cable and connections.", parent=win)
+
+
 def update_real_time_display():
     global RealTimeDisplay, ZoomSize
     if RealTimeDisplay:
         if not SimulatedRun and not CameraDisabled:
             # Capture frame-by-frame
-            image = camera.capture_image()
+            try:
+                image = camera.capture_image(wait=3.0)
+            except TimeoutError:
+                report_preview_timeout()
+                return
             
             if FocusViewEnabled and FocusPeakingEnabled:
                 try:
@@ -2264,9 +2290,13 @@ def cmd_set_real_time_display():
     if RealTimeDisplay:
         draw_capture_canvas.config(highlightthickness=3, highlightbackground="red")
         if not SimulatedRun and not CameraDisabled:
-            camera.switch_mode(vfd_config)
-            time.sleep(0.1)
-            ZoomSize = camera.capture_metadata()['ScalerCrop']
+            try:
+                camera.switch_mode(vfd_config, wait=3.0)
+                time.sleep(0.1)
+                ZoomSize = camera.capture_metadata(wait=3.0)['ScalerCrop']
+            except TimeoutError:
+                report_preview_timeout()
+                return
             time.sleep(0.1)
         win.after(10, update_real_time_display)
 
@@ -4385,6 +4415,20 @@ def create_main_window():
             win.title(f"ALT-Scann8 v{__version__} (Nano {SimulatedArduinoVersion})") # Real title for snapshots
     else:
         win.title(f"ALT-Scann8 v{__version__} (Nano {Controller_full_version})")  # setting title of the window
+    win.tk.eval("""
+# Keep modal dialogs above the main window under the Pi's Wayland/XWayland desktop.
+if {![llength [info commands ::alt_scann8_raise_dialog]]} {
+    proc ::alt_scann8_raise_dialog {w} {
+        if {[winfo exists $w] && [winfo toplevel $w] eq $w &&
+            [winfo class $w] in {Toplevel TkFDialog TkChooseDir} && ![wm overrideredirect $w]} {
+            wm transient $w .
+            wm attributes $w -topmost 1
+            raise $w
+        }
+    }
+    bind all <Map> {+::alt_scann8_raise_dialog %W}
+}
+""")
     # Get screen size - maxsize gives the usable screen size
     screen_width = win.winfo_screenwidth()
     screen_height = win.winfo_screenheight()
@@ -4491,7 +4535,7 @@ def tscann8_init():
     global ZoomSize
     global capture_display_queue, capture_display_event
     global capture_save_queue, capture_save_event
-    global MergeMertens, camera_resolutions
+    global MergeMertens, camera_resolutions, CaptureResolution
     global active_threads
     global time_save_image, time_preview_display, time_awb, time_autoexp, offset_image
     global hw_panel, hw_panel_installed
@@ -4522,6 +4566,21 @@ def tscann8_init():
     if SimulatedRun:
         # Initializes resolution list from a hardcoded sensor_modes
         camera_resolutions = CameraResolutions(simulated_sensor_modes)
+
+    # Match the default to the camera's displayed mode names before building
+    # the UI. Newer camera stacks can report nonzero crop offsets for this
+    # mode, so CameraResolutions labels it "2028x1520 *" instead.
+    if camera_resolutions is not None:
+        valid_resolutions = camera_resolutions.get_list()
+        if CaptureResolution not in valid_resolutions:
+            marked_resolution = CaptureResolution + ' *'
+            if marked_resolution in valid_resolutions:
+                CaptureResolution = marked_resolution
+            else:
+                logging.warning("Default resolution %s unavailable; using %s",
+                                CaptureResolution, valid_resolutions[0])
+                CaptureResolution = valid_resolutions[0]
+        ConfigData["CaptureResolution"] = CaptureResolution
 
     # Initialize rolling average objects
     time_save_image = RollingAverage(50)
