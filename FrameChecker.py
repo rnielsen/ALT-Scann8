@@ -25,6 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, scrolledtext, Spinbox, ttk, Label, Toplevel
 import PIL.Image, PIL.ImageTk
 import os
+from frame_paths import frame_files
 import cv2
 import numpy as np
 import time
@@ -300,13 +301,13 @@ def process_images_in_folder(folder_path, film_type, threshold):
     question_film_type = False
     file_set = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.dng') if check_dng_frames_for_misalignment else ('.png', '.jpg', '.jpeg', '.gif', '.bmp')
 
-    file_list = os.listdir(folder_path)
+    file_list = frame_files(folder_path, include_other=True)
 
     filtered_list = [
         file for file in file_list
         if os.path.splitext(file)[1].lower() in file_set
     ]
-    sorted_filenames = sorted(filtered_list)
+    sorted_filenames = filtered_list
 
     sprocket_best_x_found = False # Search again for new optimal x search position
     total_files = len(sorted_filenames)

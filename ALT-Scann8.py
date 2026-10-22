@@ -39,6 +39,7 @@ from tkinter import Label, Button, Frame, LabelFrame, Canvas, OptionMenu
 from PIL import ImageTk, Image, ImageDraw, ImageFont, __version__ as PIL_Version
 
 import os
+from frame_paths import frame_path, frame_files, frame_number
 import time
 import locale
 import json
@@ -1390,13 +1391,9 @@ def cmd_set_existing_folder():
     # Get number of files and highest frame number in selected folder
     filecount = 0
     last_frame = 0
-    for name in os.listdir(NewDir):
-        if os.path.isfile(os.path.join(NewDir, name)):
-            # Extract frame number using regular expression
-            frame_number = re.findall(r'\d+', name)
-            if len(frame_number) > 0:
-                last_frame = max(last_frame, int(frame_number[0]))  # Only one number in the filename, so we take the first
-                filecount += 1
+    for path in frame_files(NewDir, "picture-*"):
+        last_frame = max(last_frame, frame_number(path))
+        filecount += 1
 
     NewCurrentFrame = get_last_frame_popup(last_frame)
 
@@ -1492,9 +1489,11 @@ def manual_scan_advance_frame_fraction(steps):
     if not SimulatedRun:
         send_arduino_command(CMD_ADVANCE_FRAME_FRACTION, steps)
         time.sleep(0.2)
-        capture('normal')
+        if not capture('normal'):
+            return
         time.sleep(0.2)
-        run_film_collection()
+        if save_failure is None:
+            run_film_collection()
 
 
 def scan_advance_steps(steps):
@@ -1523,13 +1522,18 @@ def cmd_manual_scan_take_snap():
     if not ExperimentalMode:
         return
     if not SimulatedRun:
-        capture('manual')
+        if not reset_save_failure() or not capture('manual'):
+            return
         time.sleep(0.2)
+        if save_failure is not None:
+            return
         send_arduino_command(CMD_ADVANCE_FRAME)
         time.sleep(0.2)
-        capture('normal')
+        if not capture('normal'):
+            return
         time.sleep(0.2)
-        run_film_collection()
+        if save_failure is None:
+            run_film_collection()
 
 def rwnd_speed_down():
     global rwnd_speed_delay
@@ -1898,103 +1902,148 @@ def capture_display_thread(queue, event, id):
     logging.debug("Exiting capture_display_thread")
 
 
+class CaptureSaveError(Exception):
+    """A failed frame write has already been recorded for the UI."""
+
+
+save_failure = None
+save_failure_notified = False
+save_failure_lock = threading.Lock()
+
+
+def report_save_failure(frame, path, error):
+    global save_failure, save_failure_notified, ScanStopRequested
+    with save_failure_lock:
+        if save_failure is None:
+            save_failure = (frame, path, str(error))
+            save_failure_notified = False
+            logging.error("Cannot save frame %s to %s: %s", frame, path, error, exc_info=True)
+    ScanStopRequested = True
+
+
+def save_frame(filename, save, *args, folder=None, **kwargs):
+    """Publish complete frames atomically, preserving existing files on failure."""
+    folder = os.path.abspath(folder or CurrentDir)
+    path = frame_path(folder, filename)
+    temporary = None
+    if save_failure is not None:
+        raise CaptureSaveError("A previous frame could not be saved")
+    try:
+        path = frame_path(folder, filename, create=True)
+        stem, extension = os.path.splitext(path)
+        temporary = f"{stem}.{threading.get_ident()}.part{extension}"
+        save(*args, temporary, **kwargs)
+        os.replace(temporary, path)
+    except Exception as exc:
+        report_save_failure(frame_number(filename), path, exc)
+        raise CaptureSaveError(str(exc)) from exc
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logging.warning("Could not remove incomplete capture: %s", temporary)
+
+
+def check_save_failure():
+    """Run only on the Tk thread, including when a manual capture fails."""
+    global save_failure_notified, ScanStopRequested
+    if save_failure is not None and not save_failure_notified:
+        if ScanOngoing:
+            stop_scan()
+        ScanStopRequested = False
+        save_failure_notified = True
+        frame, path, error = save_failure
+        tk.messagebox.showerror(
+            "Frame save failed",
+            f"Scanning stopped because frame {frame} could not be saved.\n\n"
+            f"Destination: {path}\n{error}\n\n"
+            "Check the storage before restarting. The film may have advanced; "
+            "check its position and the last saved frames before resuming.")
+    if not ExitingApp:
+        win.after(50, check_save_failure)
+
+
+def reset_save_failure():
+    """Do not restart while workers are still draining an earlier scan."""
+    global save_failure, save_failure_notified, ScanStopRequested
+    if capture_save_queue.unfinished_tasks:
+        tk.messagebox.showerror("Saving frames", "Wait for pending frame saves to finish before restarting.")
+        return False
+    save_failure = None
+    save_failure_notified = False
+    ScanStopRequested = False
+    return True
+
+
 def capture_save_thread(queue, event, id):
-    global ScanStopRequested
-    global active_threads
-    global total_wait_time_save_image
-    global scan_error_counter, scan_error_total_frames_counter, DetectMisalignedFrames, MisalignedFrameTolerance
-    global FilmType
+    global active_threads, total_wait_time_save_image
+    global scan_error_counter
 
     logging.debug("Started capture_save_thread n.%i", id)
-    while not event.is_set() or not queue.empty():
-        message = queue.get()
-        curtime = time.time()
-        logging.debug("Thread %i: Retrieved message from capture save queue", id)
-        if ExitingApp:
-            break
-        if message == END_TOKEN:
-            break
-        # Invert image if button selected
-        is_dng = FileType == 'dng'
-        is_png = FileType == 'png'
-        # Extract info from message
-        type = message[0]
-        if type == REQUEST_TOKEN:
-            request = message[1]
-        elif type == IMAGE_TOKEN:
-            if is_dng:
-                logging.error("Cannot save plain image to DNG file.")
-                ScanStopRequested = True  # If target dir does not exist, stop scan
-                return
-            captured_image = message[1]
-        else:
-            logging.error(f"Invalid message type received: {type}")
-        frame_idx = message[2]
-        hdr_idx = message[3]
-        if is_dng:
-            # Saving DNG/PNG implies passing a request, not an image, therefore no additional checks (no negative allowed)
-            if hdr_idx > 1:  # Hdr frame 1 has standard filename
-                request.save_dng(HdrFrameFilenamePattern % (frame_idx, hdr_idx, FileType))
-            else:  # Non HDR
-                request.save_dng(FrameFilenamePattern % (frame_idx, FileType))                    
-                if DetectMisalignedFrames and can_check_dng_frames_for_misalignment:
-                    captured_image = request.make_array('main')
-            request.release()   # Release request ASAP (delay frame alignment check)
-            if DetectMisalignedFrames and can_check_dng_frames_for_misalignment and hdr_idx <= 1:
-                frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
-                offset_image.add_value(offset)
-                if AutoFineTuneEnabled:
-                    adjust_auto_fine_tune()
-                if not frame_centered:
-                    scan_error_counter += 1
-                    if scan_error_total_frames_counter > 0:
-                        scan_error_counter_value.set(f"{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)")
-                    with open(scan_error_log_fullpath, 'a') as f:
-                        f.write(f"Misaligned frame, {CurrentFrame}\n")
-            logging.debug("Thread %i saved request DNG image: %s ms", id,
-                          str(round((time.time() - curtime) * 1000, 1)))
-        else:
-            # If not is_dng AND negative_image AND request: Convert to image now, and do a PIL save
-            if type == REQUEST_TOKEN:
-                if NegativeImage:   # Warning  case
-                    logging.warning("Cannot reverse a PiCamera2 request, saving as captured.")
-                if hdr_idx > 1:  # Hdr frame 1 has standard filename
-                    request.save('main',
-                                 HdrFrameFilenamePattern % (frame_idx, hdr_idx, FileType))
-                else:  # Non HDR
-                    request.save('main', FrameFilenamePattern % (frame_idx, FileType))
-                    captured_image = request.make_array('main')
-                request.release()
-                logging.debug("Thread %i saved request image: %s ms", id,
-                              str(round((time.time() - curtime) * 1000, 1)))
-            else:
-                if hdr_idx > 1:  # Hdr frame 1 has standard filename
-                    logging.debug("Saving HDR frame n.%i", hdr_idx)
-                    captured_image.save(
-                        HdrFrameFilenamePattern % (frame_idx, hdr_idx, FileType), quality=95)
+    try:
+        while not event.is_set() or not queue.empty():
+            message = queue.get()
+            request = None
+            try:
+                if message == END_TOKEN:
+                    break
+                kind, payload, frame_idx, hdr_idx, folder = message
+                if kind == REQUEST_TOKEN:
+                    request = payload
+                if ExitingApp or save_failure is not None:
+                    continue
+                curtime = time.time()
+                filename = (HdrFrameFilenamePattern % (frame_idx, hdr_idx, FileType)
+                            if hdr_idx > 1 else FrameFilenamePattern % (frame_idx, FileType))
+                captured_image = None
+                if kind == REQUEST_TOKEN:
+                    if FileType == 'dng':
+                        save_frame(filename, request.save_dng, folder=folder)
+                        if DetectMisalignedFrames and can_check_dng_frames_for_misalignment and hdr_idx <= 1:
+                            captured_image = request.make_array('main')
+                    else:
+                        save_frame(filename, request.save, 'main', folder=folder)
+                        if hdr_idx <= 1:
+                            captured_image = request.make_array('main')
+                    # Release the camera buffer before alignment checks.
+                    request.release()
+                    request = None
+                elif kind == IMAGE_TOKEN:
+                    if FileType == 'dng':
+                        raise ValueError("Cannot save plain image to DNG file")
+                    save_frame(filename, payload.save, quality=95, folder=folder)
+                    if hdr_idx <= 1:
+                        captured_image = np.array(payload)
                 else:
-                    captured_image.save(FrameFilenamePattern % (frame_idx, FileType),
-                                        quality=95)
-                    # Once the PIL Image has been saved, convert it to an array, as expected by is_frame_centered
-                    captured_image = np.array(captured_image)
-                logging.debug("Thread %i saved image: %s ms", id,
-                              str(round((time.time() - curtime) * 1000, 1)))
-            frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
-            offset_image.add_value(offset)
-            if AutoFineTuneEnabled:
-                adjust_auto_fine_tune()
-            if DetectMisalignedFrames and hdr_idx <= 1 and not frame_centered:
-                scan_error_counter += 1
-                if scan_error_total_frames_counter > 0:
-                    scan_error_counter_value.set(f"{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)")
-                with open(scan_error_log_fullpath, 'a') as f:
-                    f.write(f"Misaligned frame, {CurrentFrame}\n")
-            logging.debug("Thread %i after checking misaligned frames", id)
-        aux = time.time() - curtime
-        total_wait_time_save_image += aux
-        time_save_image.add_value(aux)
-    active_threads -= 1
-    logging.debug("Exiting capture_save_thread n.%i", id)
+                    raise ValueError(f"Invalid save message type: {kind}")
+                if captured_image is not None:
+                    centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
+                    offset_image.add_value(offset)
+                    if AutoFineTuneEnabled:
+                        adjust_auto_fine_tune()
+                    if DetectMisalignedFrames and not centered:
+                        scan_error_counter += 1
+                        if scan_error_total_frames_counter > 0:
+                            scan_error_counter_value.set(f"{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)")
+                        with open(scan_error_log_fullpath, 'a') as log:
+                            log.write(f"Misaligned frame, {frame_idx}\n")
+                elapsed = time.time() - curtime
+                total_wait_time_save_image += elapsed
+                time_save_image.add_value(elapsed)
+            except Exception as exc:
+                report_save_failure(message[2], message[4], exc)
+            finally:
+                try:
+                    if request is not None:
+                        request.release()
+                finally:
+                    queue.task_done()
+    finally:
+        active_threads -= 1
+        logging.debug("Exiting capture_save_thread n.%i", id)
 
 
 def disable_canvas(canvas):
@@ -2074,7 +2123,7 @@ def draw_preview_image(preview_image, curframe, idx):
 
 
 def cmd_capture_single_step():
-    if not SimulatedRun:
+    if not SimulatedRun and (ScanOngoing or reset_save_failure()):
         capture('still')
 
 
@@ -2507,6 +2556,8 @@ def capture_hdr(mode):
     is_dng = FileType == 'dng'
     is_png = FileType == 'png'
     for exp in work_list:
+        if save_failure is not None:
+            raise CaptureSaveError("A frame save failed during HDR capture")
         exp = max(1, exp + HdrBracketShift)  # Apply bracket shift
         logging.debug("capture_hdr: exp %.2f", exp)
         if perform_dry_run:
@@ -2531,17 +2582,19 @@ def capture_hdr(mode):
             if is_dng or is_png:  # If not using DNG we can still use multithread (if not disabled)
                 # DNG + HDR, save threads not possible due to request conflicting with retrieve metadata
                 request = camera.capture_request()
-                if CurrentFrame % PreviewModuleValue == 0:
-                    captured_image = request.make_image('main')
-                    # Display preview using thread, not directly
-                    queue_item = tuple((IMAGE_TOKEN, captured_image, CurrentFrame, idx))
-                    capture_display_queue.put(queue_item)
-                curtime = time.time()
-                if idx > 1:  # Hdr frame 1 has standard filename
-                    request.save_dng(HdrFrameFilenamePattern % (CurrentFrame, idx, FileType))
-                else:  # Non HDR
-                    request.save_dng(FrameFilenamePattern % (CurrentFrame, FileType))
-                request.release()
+                try:
+                    if CurrentFrame % PreviewModuleValue == 0:
+                        captured_image = request.make_image('main')
+                        # Display preview using thread, not directly
+                        queue_item = tuple((IMAGE_TOKEN, captured_image, CurrentFrame, idx))
+                        capture_display_queue.put(queue_item)
+                    curtime = time.time()
+                    if idx > 1:  # Hdr frame 1 has standard filename
+                        save_frame(HdrFrameFilenamePattern % (CurrentFrame, idx, FileType), request.save_dng)
+                    else:  # Non HDR
+                        save_frame(FrameFilenamePattern % (CurrentFrame, FileType), request.save_dng)
+                finally:
+                    request.release()
                 logging.debug(f"Capture hdr, saved request image ({CurrentFrame}, {idx}: "
                               f"{round((time.time() - curtime) * 1000, 1)}")
             else:
@@ -2552,10 +2605,9 @@ def capture_hdr(mode):
                     curtime = time.time()
                     draw_preview_image(captured_image, CurrentFrame, idx)
                     if idx > 1:  # Hdr frame 1 has standard filename
-                        captured_image.save(
-                            HdrFrameFilenamePattern % (CurrentFrame, idx, FileType))
+                        save_frame(HdrFrameFilenamePattern % (CurrentFrame, idx, FileType), captured_image.save)
                     else:
-                        captured_image.save(FrameFilenamePattern % (CurrentFrame, FileType))
+                        save_frame(FrameFilenamePattern % (CurrentFrame, FileType), captured_image.save)
                     logging.debug(f"Capture hdr, saved image ({CurrentFrame}, {idx}): "
                                   f"{round((time.time() - curtime) * 1000, 1)} ms")
                 else:  # send image to threads
@@ -2567,7 +2619,7 @@ def capture_hdr(mode):
                         if CurrentFrame % PreviewModuleValue == 0:
                             # Display preview using thread, not directly
                             capture_display_queue.put(queue_item)
-                        capture_save_queue.put(queue_item)
+                        capture_save_queue.put(queue_item + (os.path.abspath(CurrentDir),))
                         logging.debug(f"Queueing hdr image ({CurrentFrame}, {idx})")
         idx += idx_inc
     if HdrMergeInPlace and not is_dng:
@@ -2580,7 +2632,7 @@ def capture_hdr(mode):
             # Display preview using thread, not directly
             queue_item = tuple((IMAGE_TOKEN, img, CurrentFrame, 0))
             capture_display_queue.put(queue_item)
-        img.save(FrameFilenamePattern % (CurrentFrame, FileType), quality=95)
+        save_frame(FrameFilenamePattern % (CurrentFrame, FileType), img.save, quality=95)
 
 
 def capture_single(mode):
@@ -2608,8 +2660,10 @@ def capture_single(mode):
                 time_preview_display.add_value(0)
             if mode == 'normal' or mode == 'manual':  # Do not save in preview mode, only display
                 save_queue_item = tuple((REQUEST_TOKEN, request, CurrentFrame, 0))
-                capture_save_queue.put(save_queue_item)
+                capture_save_queue.put(save_queue_item + (os.path.abspath(CurrentDir),))
                 logging.debug(f"Queueing frame ({CurrentFrame}")
+            else:
+                request.release()
         else:
             captured_image = camera.capture_image("main")
             if NegativeImage:
@@ -2622,7 +2676,7 @@ def capture_single(mode):
             else:
                 time_preview_display.add_value(0)
             if mode == 'normal' or mode == 'manual':  # Do not save in preview mode, only display
-                capture_save_queue.put(queue_item)
+                capture_save_queue.put(queue_item + (os.path.abspath(CurrentDir),))
                 logging.debug(f"Queuing frame {CurrentFrame}")
         if mode == 'manual':  # In manual mode, increase CurrentFrame
             CurrentFrame += 1
@@ -2631,21 +2685,23 @@ def capture_single(mode):
     else:
         if is_dng or is_png:
             request = camera.capture_request()
-            if CurrentFrame % PreviewModuleValue == 0:
-                captured_image = request.make_image('main')
-            else:
-                captured_image = None
-            draw_preview_image(captured_image, CurrentFrame, 0)
-            if mode == 'normal' or mode == 'manual':  # Do not save in preview mode, only display
-                request.save_dng(FrameFilenamePattern % (CurrentFrame, FileType))
-                logging.debug(f"Saving DNG frame ({CurrentFrame}: {round((time.time() - curtime) * 1000, 1)}")
-            request.release()
+            try:
+                if CurrentFrame % PreviewModuleValue == 0:
+                    captured_image = request.make_image('main')
+                else:
+                    captured_image = None
+                draw_preview_image(captured_image, CurrentFrame, 0)
+                if mode == 'normal' or mode == 'manual':  # Do not save in preview mode, only display
+                    save_frame(FrameFilenamePattern % (CurrentFrame, FileType), request.save_dng)
+                    logging.debug(f"Saving DNG frame ({CurrentFrame}: {round((time.time() - curtime) * 1000, 1)}")
+            finally:
+                request.release()
         else:
             captured_image = camera.capture_image("main")
             if NegativeImage:
                 captured_image = reverse_image(captured_image)
             draw_preview_image(captured_image, CurrentFrame, 0)
-            captured_image.save(FrameFilenamePattern % (CurrentFrame, FileType), quality=95)
+            save_frame(FrameFilenamePattern % (CurrentFrame, FileType), captured_image.save, quality=95)
             logging.debug(
                 f"Saving image ({CurrentFrame}: {round((time.time() - curtime) * 1000, 1)}")
         aux = time.time() - curtime
@@ -2663,6 +2719,19 @@ def capture_single(mode):
 # 'still': Button to capture still (specific filename)
 # 'preview': Manual scan, display only, do not save
 def capture(mode):
+    if save_failure is not None:
+        return False
+    try:
+        _capture(mode)
+        return save_failure is None
+    except CaptureSaveError:
+        return False
+    except OSError as exc:
+        report_save_failure(CurrentFrame, CurrentDir, exc)
+        return False
+
+
+def _capture(mode):
     global PreviousCurrentExposure, PreviewModuleValue
     global PreviousGainRed, PreviousGainBlue
     global total_wait_time_autoexp, total_wait_time_awb
@@ -2750,18 +2819,18 @@ def capture(mode):
 
     if PiCam2PreviewEnabled:
         if mode == 'still':
-            camera.switch_mode_and_capture_file(capture_config,
-                                                StillFrameFilenamePattern % (CurrentFrame, CurrentStill))
+            save_frame(StillFrameFilenamePattern % (CurrentFrame, CurrentStill),
+                       camera.switch_mode_and_capture_file, capture_config)
             CurrentStill += 1
         else:
             # This one should not happen, will not allow PiCam2 scan in preview mode
-            camera.switch_mode_and_capture_file(capture_config, FrameFilenamePattern % CurrentFrame)
+            save_frame(FrameFilenamePattern % (CurrentFrame, FileType), camera.switch_mode_and_capture_file, capture_config)
     else:
         # Allow time to stabilize image, it can get too fast with PiCamera2
         time.sleep(StabilizationDelayValue/1000)
         if mode == 'still':
             captured_image = camera.capture_image("main")
-            captured_image.save(StillFrameFilenamePattern % (CurrentFrame, CurrentStill))
+            save_frame(StillFrameFilenamePattern % (CurrentFrame, CurrentStill), captured_image.save)
             CurrentStill += 1
         else:
             if HdrCaptureActive:
@@ -2868,8 +2937,7 @@ def cmd_start_scan_simulated():
             ScanOngoing = False
         else:
             refresh_qr_code()
-            simulated_captured_frame_list = os.listdir(CurrentDir)
-            simulated_captured_frame_list.sort()
+            simulated_captured_frame_list = frame_files(CurrentDir, "picture-*")
             simulated_images_in_list = len(simulated_captured_frame_list)
             if simulated_images_in_list == 0:
                 logging.error("No frames exist in folder, cannot simulate scan.")
@@ -3007,6 +3075,9 @@ def start_scan():
     else:
         if BaseFolder == CurrentDir or not os.path.isdir(CurrentDir):
             tk.messagebox.showerror("Error!", "Please specify target folder where captured frames will be stored.")
+            return
+
+        if not reset_save_failure():
             return
 
         start_btn.config(text="STOP Scan", bg='red', fg='white', relief=SUNKEN)
@@ -3210,7 +3281,9 @@ def capture_loop():
             session_frames += 1
             register_frame()
             CurrentStill = 1
-            capture('normal')
+            if not capture('normal'):
+                win.after(5, capture_loop)
+                return
             if FrameDetectMode == 'PFD':
                 if not SimulatedRun:
                     try:
@@ -6904,6 +6977,7 @@ def main(argv):
         hw_panel.ALT_Scann8_init_completed()
 
     onesec_periodic_checks()
+    check_save_failure()
 
     # Main Loop
     win.mainloop()  # running the loop that works as a trigger

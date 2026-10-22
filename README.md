@@ -95,3 +95,28 @@ ALT-Scann8 optionally pings an anonymous usage count (UI+Controller version pair
 
 ### Arduino Module
 - **Arduino Core**: Framework and `Wire.h` for I2C, plus C libraries (`stdio.h`, `string.h`, `stdlib.h`). ([arduino.cc](https://www.arduino.cc/))
+
+### Large scan folders
+
+New captures are stored in numbered subdirectories, with at most 1,000 frame
+numbers per directory. Frame numbers remain continuous across directories:
+
+```text
+reel/0000/picture-00001.jpg
+reel/0000/picture-00999.jpg
+reel/0001/picture-01000.jpg
+reel/0027/picture-27315.jpg
+```
+
+The directory number is the frame number divided by 1,000 (rounded down), padded
+to four digits. All HDR exposures of a frame share its directory. Select the reel
+folder when resuming a scan or running FrameChecker. Existing flat scans and
+folders containing both layouts remain readable; new writes use subdirectories.
+If both layouts contain the same filename, the subdirectory copy takes priority.
+Existing files are not automatically moved.
+
+This avoids the FAT/VFAT per-directory limit that can report “No space left on
+device” despite ample free disk space. Save failures now stop scanning and report
+the failed frame, destination and error. Failed writes do not publish partial
+frames. Before resuming after an error, check the last saved frames and the film's
+position, since asynchronous capture may already have advanced the film.
