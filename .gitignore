@@ -238,5 +238,8 @@ fabric.properties
 
 # Local scanner session settings
 /ALT-Scann8.json
+/.smb-scans.credentials
 /AGENTS.md
 /.idea/
+/smb-scans.credentials.example
+/sync-scans.sh
